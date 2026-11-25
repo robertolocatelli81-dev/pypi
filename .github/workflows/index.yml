@@ -1,0 +1,91 @@
+name: index
+# The package pages follow the releases by themselves (2026-11-25; until then they were written by hand): every hour,
+# .github/scripts/update_index.py adds the wheel and sdist of each release newer than the page, with the `#sha256=`
+# fragment pip checks, after checking the hash against the downloaded bytes, the release's SHA256SUMS and the digest
+# GitHub states. Each changed page is committed through the GitHub contents API, so the commit is signed by GitHub,
+# then a Pages build is requested and the served page is compared byte for byte with the committed one.
+# Hourly, not started by each release: a release in another repository can start a run here only with a
+# repository_dispatch sent with a token that can write to this repository, and the workflow token of that repository
+# cannot; that would mean a personal token kept as a secret in every repository. An hourly run needs only this
+# repository's own token.
+on:
+  push:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 * * * *"
+permissions:
+  contents: read
+concurrency:
+  group: index-update
+  cancel-in-progress: false
+jobs:
+  tests:
+    # On every push, any branch: the tests, their positive control (each rule switched off must fail them), and a
+    # read-only run on the index as it is
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: The tests
+        run: python3 .github/scripts/test_update_index.py -v
+      - name: The tests can fail (mutants)
+        run: python3 .github/scripts/controllo_positivo.py
+      - name: The index as it is (read-only)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/update_index.py .
+  update:
+    # Hourly, or by hand; only on main (the branch GitHub Pages serves, measured 2026-11-25)
+    if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: The tests
+        run: python3 .github/scripts/test_update_index.py
+      - name: Add the new releases to the pages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -o pipefail   # the default shell is `bash -e`: without this, tee hides exit 1 of the script
+          python3 .github/scripts/update_index.py --write . | tee "$RUNNER_TEMP/changed.txt"
+      - name: Commit each changed page
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BRANCH: main
+        run: |
+          grep '^changed: ' "$RUNNER_TEMP/changed.txt" | cut -c10- > "$RUNNER_TEMP/files.tsv" || true
+          if [ ! -s "$RUNNER_TEMP/files.tsv" ]; then echo "no new release"; exit 0; fi
+          git status --short
+          while IFS="$(printf '\t')" read -r path msg; do
+            base64 -w0 "$path" > "$RUNNER_TEMP/page.b64"
+            if blob="$(git rev-parse --verify --quiet "HEAD:$path")"; then set -- -f sha="$blob"; else set --; fi
+            gh api -X PUT "repos/$REPO/contents/$path" -f message="$msg" -F content=@"$RUNNER_TEMP/page.b64" \
+              -f branch="$BRANCH" "$@" --jq '.commit.sha'
+          done < "$RUNNER_TEMP/files.tsv"
+      - name: The served pages are the committed ones
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          if [ ! -s "$RUNNER_TEMP/files.tsv" ]; then exit 0; fi
+          gh api -X POST "repos/$REPO/pages/builds" --jq '.status'
+          base="https://robertolocatelli81-dev.github.io/pypi"
+          for i in $(seq 1 40); do
+            ok=1
+            while IFS="$(printf '\t')" read -r path msg; do
+              url="$base/${path%index.html}"
+              if ! { curl -fsS "$url?run=$GITHUB_RUN_ID-$i" -o "$RUNNER_TEMP/served.html" && cmp -s "$RUNNER_TEMP/served.html" "$path"; }; then ok=0; fi
+            done < "$RUNNER_TEMP/files.tsv"
+            if [ "$ok" = 1 ]; then echo "served after ${i} tries"; exit 0; fi
+            sleep 30
+          done
+          echo "the served pages are not the committed ones after 20 minutes" >&2
+          exit 1

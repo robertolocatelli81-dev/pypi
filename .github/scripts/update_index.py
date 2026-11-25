@@ -8,8 +8,11 @@ plus `gh` logged in (or GH_TOKEN set) for the GitHub API.
 
 For each new file the hash is taken from the release's SHA256SUMS and checked twice before the link is written: against
 the bytes of the asset, downloaded, and against the digest GitHub states for the asset. Any difference, a release
-without SHA256SUMS, without a wheel or sdist of the package, or with a file missing from SHA256SUMS, and any page that
-cannot be read, is exit 1 with the reason, and nothing is written. Closed lists: every directory of the index, and
+without SHA256SUMS, without a wheel or without the sdist of the package (every version listed so far has both; a
+release caught while its files are still being uploaded would otherwise stay half listed), with a file missing from
+SHA256SUMS or for which GitHub states no digest, and any page that cannot be read, is exit 1 with the reason, and
+nothing is written. A page is rewritten as its own lines plus the new ones: a page whose links do not each end with a
+newline is refused, not read short. Closed lists: every directory of the index, and
 every link of the root page, is a package in FOLLOWED or in FROZEN; anything else is exit 1 with its name (a new
 package enters only by a line in FOLLOWED). Without --write nothing is written: the run says what would change.
 With --write each changed file is printed as `changed: PATH<TAB>COMMIT MESSAGE`."""
@@ -74,7 +77,10 @@ def read_page(path, name):
     head = PAGE_HEAD.format(name)
     if not (text.startswith(head) and text.endswith(PAGE_TAIL)):
         raise Refused("%s: not in the form this script writes (head or tail differ)" % path)
-    links = text[len(head):len(text) - len(PAGE_TAIL)].split("\n")[:-1] if text != head + PAGE_TAIL else []
+    body = text[len(head):len(text) - len(PAGE_TAIL)]
+    if body and not body.endswith("\n"):         # split("\n")[:-1] would drop the last line in silence
+        raise Refused("%s: the last line before the tail does not end with a newline" % path)
+    links = body.split("\n")[:-1]
     for line in links:
         m = LINK.match(line)
         if not m or m.group("repo") not in (FOLLOWED.get(name), name):
@@ -115,17 +121,18 @@ def release_links(name, repo, rel, with_rp):
     if "SHA256SUMS" not in assets:
         raise Refused("%s %s: the release has no SHA256SUMS" % (repo, rel["tag_name"]))
     listed = sums(fetch(assets["SHA256SUMS"]["browser_download_url"]).decode("ascii"))
-    files = sorted(n for n in assets if n.startswith(stem + "-") and n.endswith(".whl")) + \
-        [n for n in assets if n == stem + ".tar.gz"]
-    if not files:
-        raise Refused("%s %s: no wheel or sdist named %s-*.whl or %s.tar.gz" % (repo, rel["tag_name"], stem, stem))
+    wheels = sorted(n for n in assets if n.startswith(stem + "-") and n.endswith(".whl"))
+    files = wheels + [n for n in assets if n == stem + ".tar.gz"]
+    if not wheels or len(files) == len(wheels):
+        raise Refused("%s %s: needs a wheel %s-*.whl and the sdist %s.tar.gz, found %s" % (
+            repo, rel["tag_name"], stem, stem, files))
     out = []
     for f in files:
         if f not in listed:
             raise Refused("%s %s: %s is not in SHA256SUMS" % (repo, rel["tag_name"], f))
         data = fetch(assets[f]["browser_download_url"])
         got = hashlib.sha256(data).hexdigest()
-        stated = (assets[f].get("digest") or "sha256:" + got).split(":", 1)
+        stated = (assets[f].get("digest") or "absent").split(":", 1)
         if got != listed[f] or stated != ["sha256", got]:
             raise Refused("%s %s: %s: downloaded %s, SHA256SUMS %s, GitHub digest %s" % (
                 repo, rel["tag_name"], f, got, listed[f], ":".join(stated)))
@@ -136,7 +143,10 @@ def release_links(name, repo, rel, with_rp):
             if not rp:
                 raise Refused("%s %s: %s declares no Requires-Python, and the page states it" % (repo, rel["tag_name"], f))
             attr = ' data-requires-python="%s"' % html.escape(rp, quote=True)
-        out.append('<a href="%s#sha256=%s"%s>%s</a><br>' % (url, got, attr, f))
+        line = '<a href="%s#sha256=%s"%s>%s</a><br>' % (url, got, attr, f)
+        if not re.fullmatch(r"[A-Za-z0-9._+-]+", f) or not LINK.match(line):   # else the next run could not read it
+            raise Refused("%s %s: %r would write a line this script does not read" % (repo, rel["tag_name"], f))
+        out.append(line)
     return out
 
 

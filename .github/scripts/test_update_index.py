@@ -6,6 +6,7 @@ import contextlib
 import hashlib
 import io
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -221,10 +222,89 @@ class Refuses(Base):
 
     def test_a_release_without_a_wheel_or_sdist_of_the_package(self):
         self.fake.add("pkg-a", "v0.2.0", {"pkg-a-0.2.0.zip": b"z", "other_pkg-0.2.0.tar.gz": b"t"})
-        self.refused("no wheel or sdist named pkg_a-0.2.0-*.whl or pkg_a-0.2.0.tar.gz")
+        self.refused("needs a wheel pkg_a-0.2.0-*.whl and the sdist pkg_a-0.2.0.tar.gz, found []")
+
+    def test_a_release_with_only_the_wheel_or_only_the_sdist(self):
+        # found 2026-11-25: such a release was listed with one file, and the other was never added afterwards
+        stem = "pkg_a-0.2.0"
+        for files in ({stem + "-py3-none-any.whl": wheel(stem)}, {stem + ".tar.gz": sdist(stem)},
+                      {stem + "-py3-none-any.whl": wheel(stem), "pkg-a-0.2.0.tar.gz": sdist(stem)}):
+            self.tearDown()
+            self.setUp()
+            self.fake.add("pkg-a", "v0.2.0", files)
+            self.refused("needs a wheel pkg_a-0.2.0-*.whl and the sdist pkg_a-0.2.0.tar.gz, found ['%s']" % sorted(
+                n for n in files if n.startswith(stem))[0])
+
+    def test_a_wheel_of_another_package_in_the_release_is_not_listed(self):
+        files = self.fake.release("pkg-a", "0.2.0")
+        files["other_pkg-0.2.0-py3-none-any.whl"] = wheel("other_pkg-0.2.0")
+        self.fake.releases["pkg-a"].pop()
+        self.fake.add("pkg-a", "v0.2.0", files)
+        code, out = self.run_main("--write")
+        self.assertEqual(code, 0, out)
+        self.assertNotIn(b"other_pkg", self.snapshot()["pkg-a/index.html"])
+
+    def test_a_file_for_which_github_states_no_digest(self):
+        # found 2026-11-25: an absent digest was read as equal to the downloaded bytes
+        for absent in (None, "", "pop"):
+            self.tearDown()
+            self.setUp()
+            self.fake.release("pkg-a", "0.2.0")
+            for a in self.fake.releases["pkg-a"][-1]["assets"]:
+                a.pop("digest") if absent == "pop" else a.__setitem__("digest", absent)
+            self.refused("GitHub digest absent")
+
+    def test_a_file_name_that_would_write_a_line_not_read_back(self):
+        stem = "pkg_a-0.2.0"
+        for name in (stem + '-a"b.whl', stem + "-a#b.whl", stem + "-<i>.whl", stem + "-a&b.whl"):
+            self.tearDown()
+            self.setUp()
+            self.fake.add("pkg-a", "v0.2.0", {name: wheel(stem), stem + ".tar.gz": sdist(stem)})
+            self.refused("would write a line this script does not read")
+
+    def test_a_page_whose_last_link_does_not_end_with_a_newline(self):
+        # found 2026-11-25: the last link was dropped in silence and the page rewritten without it
+        p = os.path.join(self.d, "pkg-a", "index.html")
+        with open(p, encoding="utf-8", newline="") as fh:
+            text = fh.read()
+        for body_end in ("<br>" + ui.PAGE_TAIL, "<br>\n<p>anything</p>" + ui.PAGE_TAIL):
+            self.write("pkg-a/index.html", text.replace("<br>\n" + ui.PAGE_TAIL, body_end))
+            self.fake.releases["pkg-a"] = self.fake.releases["pkg-a"][:1]
+            self.fake.release("pkg-a", "0.2.0")
+            self.refused("the last line before the tail does not end with a newline")
+
+    def test_a_page_whose_tail_or_hash_length_differs(self):
+        p = os.path.join(self.d, "pkg-a", "index.html")
+        with open(p, encoding="utf-8", newline="") as fh:
+            text = fh.read()
+        self.fake.release("pkg-a", "0.2.0")
+        self.write("pkg-a/index.html", text[:-len(ui.PAGE_TAIL)] + "</body></html>")
+        self.refused("head or tail differ")
+        self.write("pkg-a/index.html", re.sub(r"#sha256=[0-9a-f]", "#sha256=", text, count=1))   # 63 hex digits
+        self.refused("line not read")
+
+    def test_sha256sums_that_is_not_ascii(self):
+        stem = "pkg_a-0.2.0"
+        w, s = wheel(stem), sdist(stem)
+        self.fake.add("pkg-a", "v0.2.0", {stem + "-py3-none-any.whl": w, stem + ".tar.gz": s}, sums="%s  %s\n%s  %s\n%s  %s\n" % (
+            hashlib.sha256(w).hexdigest(), stem + "-py3-none-any.whl", hashlib.sha256(s).hexdigest(), stem + ".tar.gz",
+            "0" * 64, "caf\u00e9.txt"))
+        self.fake.files = {u: (d.decode().encode("latin-1") if u.endswith("v0.2.0/SHA256SUMS") else d)
+                           for u, d in self.fake.files.items()}
+        self.refused("UnicodeDecodeError")
+
+    def test_a_wheel_with_two_metadata_files(self):
+        stem = "pkg_a-0.2.0"
+        b = io.BytesIO()
+        with zipfile.ZipFile(b, "w") as z:
+            z.writestr("pkg_a-0.2.0.dist-info/METADATA", "Requires-Python: >=3.10\n")
+            z.writestr("other-1.0.dist-info/METADATA", "Requires-Python: >=3.10\n")
+        self.write("pkg-a/index.html", page("pkg-a", [link("pkg-a", "0.1.0", n, d, rp="&gt;=3.10") for n, d in self.old.items()]))
+        self.fake.add("pkg-a", "v0.2.0", {stem + "-py3-none-any.whl": b.getvalue(), stem + ".tar.gz": sdist(stem)})
+        self.refused("2 METADATA files")
 
     def test_a_tag_that_is_not_vxyz(self):
-        for tag in ("0.2.0", "v0.2", "v١.2.3", "v1.2.3 "):
+        for tag in ("0.2.0", "v0.2", "v١.2.3", "v1.2.3 ", "v1.2.3\n"):
             self.tearDown()
             self.setUp()
             self.fake.add("pkg-a", tag, {})
@@ -279,7 +359,7 @@ class TheIndexAsItIs(unittest.TestCase):
             ui.api = saved
 
     def test_command_line_refuses_arguments_it_does_not_understand(self):
-        for bad in (("--wrte", "."), (".", "--write"), ("--write", ".", ".")):
+        for bad in (("--wrte", "."), (".", "--write"), ("--write", ".", "."), ("--wrte",)):
             r = subprocess.run([sys.executable, os.path.join(HERE, "update_index.py"), *bad], capture_output=True, text=True)
             self.assertEqual(r.returncode, 2, bad)
             self.assertIn("usage:", r.stderr)

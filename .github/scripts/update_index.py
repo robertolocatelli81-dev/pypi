@@ -40,7 +40,6 @@ FOLLOWED = {
 # directories of the index that no release updates any more: name -> reason
 FROZEN = {
     "cra-evidence": "renamed omega-cra-evol in 0.10.0: its new releases are listed under omega-cra-evol",
-    "omega-health-companion": "its repository is not public (2026-11-25): no release of it can be followed",
 }
 TAG = re.compile(r"v([0-9]+)\.([0-9]+)\.([0-9]+)\Z")   # ASCII digits only
 LINK = re.compile(r'<a href="https://github\.com/' + OWNER + r'/(?P<repo>[A-Za-z0-9_.-]+)/releases/download/'
